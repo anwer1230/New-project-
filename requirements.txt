@@ -1,0 +1,4 @@
+Flask>=2.2
+Flask-SocketIO>=5.1
+telethon>=1.27
+eventlet>=0.33
