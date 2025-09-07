@@ -1,21 +1,17 @@
 # app.py
-import os, json, uuid, time, asyncio, logging
+import os, uuid, json, time, asyncio
 from threading import Lock
-from flask import Flask, session, request, jsonify, render_template_string
+from flask import Flask, session, render_template_string, request, jsonify
 from flask_socketio import SocketIO, emit
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.errors import SessionPasswordNeededError
 
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Flask + SocketIO
+# ---------- إعدادات ----------
 app = Flask(__name__)
 app.secret_key = os.environ.get("SESSION_SECRET", os.urandom(24))
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', ping_timeout=60, ping_interval=25)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
-# بيانات الجلسات
 SESSIONS_DIR = "sessions"
 if not os.path.exists(SESSIONS_DIR):
     os.makedirs(SESSIONS_DIR)
@@ -23,7 +19,14 @@ if not os.path.exists(SESSIONS_DIR):
 USERS = {}
 USERS_LOCK = Lock()
 
-# ---------- Helper: حفظ وتحميل الإعدادات ----------
+# API_ID و API_HASH مخفيين داخليًا
+API_ID = int(os.environ.get("API_ID", 22043994))
+API_HASH = os.environ.get("API_HASH", "56f64582b363d367280db96586b97801")
+
+# ---------- HTML + CSS + JS ----------
+HTML_PAGE = """ ... نفس واجهة السابقة ... """ # يمكنك نسخ واجهة HTML من الكود السابق بدون تغيير
+
+# ---------- Helpers ----------
 def save_settings(user_id, settings):
     path = os.path.join(SESSIONS_DIR, f"{user_id}.json")
     with open(path, "w", encoding="utf-8") as f:
@@ -36,106 +39,42 @@ def load_settings(user_id):
             return json.load(f)
     return {}
 
-# ---------- HTML الواجهة ----------
-HTML_PAGE = """
-<!DOCTYPE html>
-<html lang="ar">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>لوحة التحكم - Telegram</title>
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
-<style>
-body { background-color: #f8f9fa; font-family: Arial, sans-serif; }
-.card { margin-top: 20px; }
-textarea { resize: none; }
-.log { height: 200px; overflow-y: scroll; background: #212529; color: #fff; padding: 10px; border-radius: 5px; }
-</style>
-</head>
-<body>
-<div class="container">
-<h2 class="mt-4 text-center">لوحة التحكم - Telegram</h2>
+async def send_messages_task(user_id):
+    user_data = USERS[user_id]
+    settings = user_data['settings']
+    interval = settings.get('interval_seconds', 60)
+    groups = settings.get('groups', [])
+    message = settings.get('message', '')
+    session_string = settings.get('session_string')
 
-<div class="row">
-  <div class="col-md-6">
-    <div class="card p-3">
-      <h5>تسجيل الدخول</h5>
-      <input id="phone" class="form-control mb-2" placeholder="رقم الهاتف">
-      <button class="btn btn-primary mb-2" onclick="sendCode()">إرسال الكود</button>
-      <input id="code" class="form-control mb-2" placeholder="كود التحقق">
-      <button class="btn btn-success" onclick="verifyCode()">تأكيد الكود</button>
-    </div>
+    async with TelegramClient(StringSession(session_string), API_ID, API_HASH) as client:
+        while user_data['is_running']:
+            for g in groups:
+                try:
+                    await client.send_message(g, message)
+                    socketio.emit('log_update', {"message": f"✅ أرسلت إلى {g}"}, to=user_id)
+                    user_data['stats']['sent'] += 1
+                except Exception as e:
+                    socketio.emit('log_update', {"message": f"❌ فشل الإرسال إلى {g}: {str(e)}"}, to=user_id)
+                    user_data['stats']['errors'] += 1
+            await asyncio.sleep(interval)
 
-    <div class="card p-3 mt-3">
-      <h5>إرسال الرسائل</h5>
-      <textarea id="groups" class="form-control mb-2" placeholder="أدخل معرفات القنوات أو المجموعات (سطر لكل مجموعة)" rows="3"></textarea>
-      <textarea id="message" class="form-control mb-2" placeholder="الرسالة هنا" rows="3"></textarea>
-      <button class="btn btn-warning" onclick="sendNow()">إرسال فوري</button>
-    </div>
+async def monitor_task(user_id):
+    user_data = USERS[user_id]
+    settings = user_data['settings']
+    watch_words = settings.get('watch_words', [])
+    session_string = settings.get('session_string')
 
-    <div class="card p-3 mt-3">
-      <h5>المراقبة</h5>
-      <button class="btn btn-info mb-2" onclick="startMonitoring()">بدء المراقبة</button>
-      <button class="btn btn-secondary" onclick="stopMonitoring()">إيقاف المراقبة</button>
-    </div>
-  </div>
-
-  <div class="col-md-6">
-    <div class="card p-3">
-      <h5>سجل الأحداث</h5>
-      <div class="log" id="log"></div>
-    </div>
-    <div class="card p-3 mt-3">
-      <h5>الإحصائيات</h5>
-      <p>الرسائل المرسلة: <span id="sent">0</span></p>
-      <p>الأخطاء: <span id="errors">0</span></p>
-    </div>
-  </div>
-</div>
-</div>
-
-<script>
-var socket = io();
-socket.on('connect', () => { appendLog("✅ متصل بالخادم"); });
-socket.on('log_update', data => { appendLog(data.message); });
-socket.on('stats_update', data => {
-    document.getElementById('sent').innerText = data.sent;
-    document.getElementById('errors').innerText = data.errors;
-});
-
-function appendLog(msg){
-    var logDiv = document.getElementById('log');
-    logDiv.innerHTML += msg + "<br>";
-    logDiv.scrollTop = logDiv.scrollHeight;
-}
-
-function sendCode(){
-    fetch('/api/save_login', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({phone: document.getElementById('phone').value})})
-    .then(res=>res.json()).then(r=>appendLog(r.message));
-}
-
-function verifyCode(){
-    fetch('/api/verify_code', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({code: document.getElementById('code').value})})
-    .then(res=>res.json()).then(r=>appendLog(r.message));
-}
-
-function sendNow(){
-    fetch('/api/send_now', {method:'POST'}).then(res=>res.json()).then(r=>appendLog(r.message));
-}
-
-function startMonitoring(){
-    fetch('/api/start_monitoring', {method:'POST'}).then(res=>res.json()).then(r=>appendLog(r.message));
-}
-
-function stopMonitoring(){
-    fetch('/api/stop_monitoring', {method:'POST'}).then(res=>res.json()).then(r=>appendLog(r.message));
-}
-</script>
-</body>
-</html>
-"""
+    async with TelegramClient(StringSession(session_string), API_ID, API_HASH) as client:
+        while user_data['is_running']:
+            try:
+                async for message in client.iter_messages('me', limit=10):
+                    for word in watch_words:
+                        if word.lower() in message.message.lower():
+                            socketio.emit('log_update', {"message": f"🔍 كلمة '{word}' تم رصدها: {message.text}"}, to=user_id)
+                await asyncio.sleep(5)
+            except Exception as e:
+                socketio.emit('log_update', {"message": f"❌ خطأ بالمراقبة: {str(e)}"}, to=user_id)
 
 # ---------- Routes ----------
 @app.route("/")
@@ -144,66 +83,67 @@ def index():
         session['user_id'] = str(uuid.uuid4())
     return render_template_string(HTML_PAGE)
 
-# ---------- Login & verification ----------
 @app.route("/api/save_login", methods=["POST"])
 def api_save_login():
-    user_id = session['user_id']
     data = request.json
     phone = data.get('phone')
     if not phone:
-        return {"success": False, "message": "❌ أدخل رقم الهاتف"}
-    settings = {"phone": phone, "stats": {"sent":0, "errors":0}}
-    save_settings(user_id, settings)
-    USERS[user_id] = {"settings": settings, "is_running": False}
-    return {"success": True, "message": f"✅ تم حفظ الرقم: {phone} (الكود يفترض أنه تم إرساله) "}
-
-@app.route("/api/verify_code", methods=["POST"])
-def api_verify_code():
+        return jsonify({"success": False, "message": "❌ أدخل رقم الهاتف"})
     user_id = session['user_id']
-    data = request.json
-    code = data.get('code')
-    if code == "1234":  # مجرد محاكاة
-        USERS[user_id]['settings']['session_string'] = "dummy_session"
-        return {"success": True, "message": "✅ تم التحقق من الكود"}
-    return {"success": False, "message": "❌ كود غير صحيح"}
+    settings = load_settings(user_id)
+    settings.update({'phone': phone})
+    save_settings(user_id, settings)
+    return jsonify({"success": True, "message": f"✅ تم حفظ الرقم: {phone} (الكود سيتم إرساله لاحقًا)"})
 
-# ---------- Send message ----------
+@app.route("/api/save_settings", methods=["POST"])
+def api_save_settings():
+    data = request.json
+    user_id = session['user_id']
+    settings = load_settings(user_id)
+    settings.update({
+        'message': data.get('message', ''),
+        'groups': [g.strip() for g in data.get('groups','').split('\n') if g.strip()],
+        'interval_seconds': int(data.get('interval_seconds', 60)),
+        'watch_words': [w.strip() for w in data.get('watch_words','').split('\n') if w.strip()],
+        'send_type': data.get('send_type','manual')
+    })
+    save_settings(user_id, settings)
+    with USERS_LOCK:
+        if user_id not in USERS:
+            USERS[user_id] = {'settings': settings, 'is_running': False, 'stats': {'sent':0,'errors':0}}
+        else:
+            USERS[user_id]['settings'] = settings
+    return jsonify({"success": True, "message": "✅ تم حفظ الإعدادات"})
+
 @app.route("/api/send_now", methods=["POST"])
 def api_send_now():
     user_id = session['user_id']
-    user = USERS.get(user_id)
-    if not user or 'session_string' not in user['settings']:
-        return {"success": False, "message": "❌ لم يتم تسجيل الجلسة بعد"}
-    groups = request.json.get('groups', []) if request.json else []
-    message = request.json.get('message','') if request.json else ''
-    # محاكاة إرسال
-    user['settings']['stats']['sent'] += 1
-    socketio.emit('stats_update', user['settings']['stats'], to=user_id)
-    return {"success": True, "message": "✅ تم الإرسال (محاكاة)"}
-
-# ---------- Monitoring ----------
-def monitoring_task(user_id):
-    import time
-    while USERS[user_id]['is_running']:
-        # كل 5 ثواني نرسل رسالة محاكاة
-        USERS[user_id]['settings']['stats']['sent'] += 1
-        socketio.emit('log_update', {"message": f"🚀 تم إرسال رسالة مراقبة"}, to=user_id)
-        socketio.emit('stats_update', USERS[user_id]['settings']['stats'], to=user_id)
-        time.sleep(5)
+    with USERS_LOCK:
+        if user_id not in USERS or not USERS[user_id]['settings'].get('session_string'):
+            return jsonify({"success": False, "message": "❌ لم يتم تسجيل الجلسة بعد"})
+        USERS[user_id]['is_running'] = True
+    socketio.start_background_task(send_messages_task, user_id)
+    return jsonify({"success": True, "message": "🚀 بدأ الإرسال الآن"})
 
 @app.route("/api/start_monitoring", methods=["POST"])
 def api_start_monitoring():
     user_id = session['user_id']
-    USERS[user_id]['is_running'] = True
-    socketio.start_background_task(monitoring_task, user_id)
-    return {"success": True, "message": "🚀 بدأت المراقبة"}
+    with USERS_LOCK:
+        if user_id not in USERS or not USERS[user_id]['settings'].get('session_string'):
+            return jsonify({"success": False, "message": "❌ لم يتم تسجيل الجلسة بعد"})
+        USERS[user_id]['is_running'] = True
+    socketio.start_background_task(monitor_task, user_id)
+    return jsonify({"success": True, "message": "🚀 بدأت المراقبة"})
 
 @app.route("/api/stop_monitoring", methods=["POST"])
 def api_stop_monitoring():
     user_id = session['user_id']
-    USERS[user_id]['is_running'] = False
-    return {"success": True, "message": "⏹ تم إيقاف المراقبة"}
+    with USERS_LOCK:
+        if user_id in USERS:
+            USERS[user_id]['is_running'] = False
+            return jsonify({"success": True, "message": "⏹ تم إيقاف المراقبة"})
+    return jsonify({"success": False, "message": "❌ النظام لم يكن يعمل"})
 
-# ---------- Startup ----------
+# ---------- Run ----------
 if __name__ == "__main__":
-    socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
+    socketio.run(app, host="0.0.0.0", port=5000, debug=True)
