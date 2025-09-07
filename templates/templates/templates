@@ -1,1 +1,124 @@
 index.html 
+<!doctype html>
+<html lang="ar">
+<head>
+  <meta charset="utf-8">
+  <title>لوحة تحكم Telegram</title>
+  <style>
+    body { font-family: Arial, sans-serif; direction: rtl; padding: 20px; }
+    .box { border:1px solid #ddd; padding:12px; margin-bottom:10px; border-radius:6px; }
+    .hidden { display:none; }
+    .connected { color: white; background: green; padding:6px 10px; border-radius:6px; }
+    .disconnected { color: white; background: red; padding:6px 10px; border-radius:6px; }
+    textarea { width:100%; height:80px; }
+    input, button { padding:8px; margin-top:6px; width:100%; box-sizing: border-box; }
+  </style>
+</head>
+<body>
+  <h2>لوحة التحكم - Telegram Auto</h2>
+  <div id="statusBox" class="box">
+    حالة الاتصال: <span id="connStatus" class="disconnected">غير متصل</span>
+  </div>
+
+  <div id="loginBox" class="box">
+    <h3>إعدادات الدخول</h3>
+    <input id="phone" placeholder="رقم الهاتف +9665xxxxxxx">
+    <input id="password" placeholder="كلمة مرور 2FA (اختياري)">
+    <button onclick="saveLogin()">حفظ وإرسال الكود</button>
+    <div id="codeArea" class="hidden">
+      <input id="code" placeholder="أدخل كود التحقق">
+      <button onclick="verifyCode()">تأكيد الكود</button>
+    </div>
+    <div id="loginMsg"></div>
+  </div>
+
+  <div id="settingsBox" class="box hidden">
+    <h3>إعدادات التشغيل</h3>
+    <label>الرسالة:</label>
+    <textarea id="message"></textarea>
+    <label>روابط المجموعات (كل سطر رابط أو معرف):</label>
+    <textarea id="groups"></textarea>
+    <label>فاصل الإرسال بالثواني:</label>
+    <input id="interval_seconds" type="number" value="3600">
+    <label>كلمات المراقبة (كل سطر كلمة):</label>
+    <textarea id="watch_words"></textarea>
+    <button onclick="saveSettings()">حفظ الإعدادات</button>
+  </div>
+
+  <div id="controls" class="box hidden">
+    <h3>التحكم</h3>
+    <button onclick="startMonitoring()">بدء المراقبة</button>
+    <button onclick="stopMonitoring()">إيقاف المراقبة</button>
+    <button onclick="sendNow()">إرسال فوري</button>
+  </div>
+
+  <div id="log" class="box">
+    <h3>السجل</h3>
+    <div id="logLines"></div>
+  </div>
+
+<script>
+async function api(path, method='GET', body=null){
+  const opts = { method, headers: {} };
+  if(body){ opts.headers['Content-Type']='application/json'; opts.body=JSON.stringify(body); }
+  const res = await fetch(path, opts);
+  return res.json();
+}
+
+function appendLog(txt){ const el = document.getElementById('logLines'); el.innerHTML = `<div>[${new Date().toLocaleTimeString()}] ${txt}</div>` + el.innerHTML; }
+
+async function updateLoginStatus(){
+  const s = await api('/api/get_login_status');
+  const box = document.getElementById('connStatus');
+  if(s.connected){ box.className='connected'; box.innerText='متصل'; document.getElementById('loginBox').classList.add('hidden'); document.getElementById('settingsBox').classList.remove('hidden'); document.getElementById('controls').classList.remove('hidden'); }
+  else { box.className='disconnected'; box.innerText='غير متصل'; document.getElementById('loginBox').classList.remove('hidden'); document.getElementById('settingsBox').classList.add('hidden'); document.getElementById('controls').classList.add('hidden'); }
+}
+
+async function saveLogin(){
+  const phone = document.getElementById('phone').value;
+  const password = document.getElementById('password').value;
+  const res = await api('/api/save_login','POST',{phone,password});
+  appendLog(res.message || JSON.stringify(res));
+  document.getElementById('loginMsg').innerText = res.message || '';
+  if(res.code_required){ document.getElementById('codeArea').classList.remove('hidden'); }
+  updateLoginStatus();
+}
+
+async function verifyCode(){
+  const code = document.getElementById('code').value;
+  const res = await api('/api/verify_code','POST',{code});
+  appendLog(res.message || JSON.stringify(res));
+  updateLoginStatus();
+}
+
+async function saveSettings(){
+  const message = document.getElementById('message').value;
+  const groups = document.getElementById('groups').value;
+  const interval_seconds = document.getElementById('interval_seconds').value;
+  const watch_words = document.getElementById('watch_words').value;
+  const res = await api('/api/save_settings','POST',{message,groups,interval_seconds,watch_words,send_type:'automatic'});
+  appendLog(res.message || JSON.stringify(res));
+}
+
+async function startMonitoring(){
+  const res = await api('/api/start_monitoring','POST', {});
+  appendLog(res.message || JSON.stringify(res));
+}
+
+async function stopMonitoring(){
+  const res = await api('/api/stop_monitoring','POST', {});
+  appendLog(res.message || JSON.stringify(res));
+}
+
+async function sendNow(){
+  const res = await api('/api/send_now','POST', {});
+  appendLog(res.message || JSON.stringify(res));
+}
+
+window.onload = function(){
+  updateLoginStatus();
+  // يمكنك إضافة تحديث دوري أو WebSocket لاحقًا
+}
+</script>
+</body>
+</html>
