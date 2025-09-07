@@ -1,247 +1,170 @@
-# telegram_dashboard_full.py
-import os, time, uuid
-from threading import Lock
+import os, time, uuid, sqlite3, asyncio, threading
 from flask import Flask, render_template_string, request, session, jsonify
 from flask_socketio import SocketIO, emit
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-import eventlet
-eventlet.monkey_patch()
 
-# ================== إعدادات ==================
-API_ID = int(os.environ.get("API_ID", "22043994"))
-API_HASH = os.environ.get("API_HASH", "56f64582b363d367280db96586b97801")
-SECRET_KEY = os.environ.get("SESSION_SECRET", os.urandom(24))
-SESSION_DIR = "sessions"
-if not os.path.exists(SESSION_DIR):
-    os.makedirs(SESSION_DIR)
-
+# ---------- إعداد Flask + SocketIO ----------
 app = Flask(__name__)
-app.secret_key = SECRET_KEY
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+app.secret_key = os.urandom(24)
+socketio = SocketIO(app, cors_allowed_origins='*', async_mode='threading')
 
-# ================== بيانات المستخدم ==================
-USERS = {}
-USERS_LOCK = Lock()
+# ---------- إعداد قاعدة البيانات SQLite ----------
+DB_FILE = 'users.db'
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+c = conn.cursor()
+c.execute('''CREATE TABLE IF NOT EXISTS users (user_id TEXT PRIMARY KEY, phone TEXT, session_string TEXT, message TEXT, groups TEXT, interval_sec INTEGER, watch_words TEXT, stats_sent INTEGER, stats_errors INTEGER)''')
+conn.commit()
 
-# ================== واجهة المستخدم ==================
-HTML_TEMPLATE = """
+# ---------- القوالب HTML ----------
+HTML_PAGE = '''
 <!DOCTYPE html>
 <html lang="ar">
 <head>
 <meta charset="UTF-8">
-<title>لوحة التحكم - Telegram</title>
+<title>لوحة تحكم Telegram</title>
+<script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
 <style>
-body{font-family:tahoma,sans-serif;background:#f2f2f2;color:#333;margin:0;padding:0;}
-header{background:#5C3D99;color:#fff;padding:15px;text-align:center;font-size:24px;}
-.container{padding:20px;max-width:900px;margin:auto;}
-.card{background:#fff;padding:20px;margin-bottom:20px;border-radius:10px;box-shadow:0 2px 6px rgba(0,0,0,0.2);}
-input,textarea,button{width:100%;padding:10px;margin:5px 0;border-radius:5px;border:1px solid #ccc;}
-button{background:#5C3D99;color:#fff;border:none;cursor:pointer;}
-button:hover{background:#452b7a;}
-.status{padding:10px;margin-top:10px;background:#e2e2e2;border-radius:5px;height:150px;overflow:auto;}
-.flex{display:flex;gap:10px;}
-.flex > *{flex:1;}
+body { font-family: Tahoma, sans-serif; background:#f4f4f9; color:#333; padding:20px; }
+h1 { color:#5C3D99; }
+input, textarea { width:100%; padding:8px; margin:5px 0; border-radius:5px; border:1px solid #ccc; }
+button { padding:10px 20px; background:#5C3D99; color:white; border:none; border-radius:5px; cursor:pointer; margin:5px 0; }
+button:hover { background:#7A57D1; }
+.log { background:#fff; padding:10px; border-radius:5px; max-height:200px; overflow-y:auto; margin-top:10px; border:1px solid #ccc; }
 </style>
-<script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
 </head>
 <body>
-<header>لوحة التحكم - Telegram</header>
-<div class="container">
-
-<div class="card">
-<h3>تسجيل الدخول</h3>
-<input type="text" id="phone" placeholder="+967774523876">
-<button onclick="saveLogin()">حفظ & ارسال الكود</button>
-<input type="text" id="code" placeholder="كود التحقق">
-<button onclick="verifyCode()">تحقق الكود</button>
-<div id="login_status" class="status"></div>
-</div>
-
-<div class="card">
-<h3>إرسال الرسائل</h3>
+<h1>لوحة تحكم Telegram</h1>
+<h2>تسجيل الدخول</h2>
+<input id="phone" placeholder="أدخل رقم الهاتف +967...">
+<button onclick="savePhone()">حفظ وارسال الكود</button>
+<input id="code" placeholder="كود التحقق">
+<button onclick="verifyCode()">تحقق من الكود</button>
+<h2>إرسال الرسائل</h2>
 <textarea id="groups" placeholder="أدخل معرفات القنوات أو المجموعات (سطر لكل مجموعة)"></textarea>
 <textarea id="message" placeholder="الرسالة هنا"></textarea>
-<div class="flex">
-<input type="number" id="interval" placeholder="الفترة بالثواني" value="30">
+<input type="number" id="interval" placeholder="وقت الإرسال بالثواني">
+<label><input type="checkbox" id="auto_send"> ارسال تلقائي</label>
 <button onclick="sendNow()">إرسال الآن</button>
-<button onclick="toggleAutoSend()">تفعيل الإرسال التلقائي</button>
-</div>
-<div id="send_status" class="status"></div>
-</div>
-
-<div class="card">
-<h3>المراقبة</h3>
+<h2>المراقبة</h2>
 <textarea id="watch_words" placeholder="كلمات المراقبة (سطر لكل كلمة)"></textarea>
-<button onclick="startMonitoring()">ابدأ المراقبة</button>
-<button onclick="stopMonitoring()">أوقف المراقبة</button>
-<div id="monitor_status" class="status"></div>
-</div>
-
-<div class="card">
-<h3>الإحصائيات</h3>
-<div id="stats" class="status">الرسائل المرسلة: 0<br>الأخطاء: 0</div>
-</div>
-
-</div>
+<button onclick="startMonitoring()">تشغيل المراقبة</button>
+<button onclick="stopMonitoring()">إيقاف المراقبة</button>
+<h2>سجل الأحداث</h2>
+<div class="log" id="log"></div>
+<h2>الإحصائيات</h2>
+<div id="stats">الرسائل المرسلة: 0<br>الأخطاء: 0</div>
 <script>
 var socket = io();
-var autoSendInterval = null;
-
-socket.on('connect',()=>{socket.emit('join',{user_id:'{{user_id}}'});});
-socket.on('log_update',data=>{
-    let el=document.getElementById('send_status');
-    let m=document.createElement('div'); m.textContent=data.message;
-    el.appendChild(m); el.scrollTop=el.scrollHeight;
-});
-socket.on('monitor_update',data=>{
-    let el=document.getElementById('monitor_status');
-    let m=document.createElement('div'); m.textContent=data.message;
-    el.appendChild(m); el.scrollTop=el.scrollHeight;
-});
-socket.on('stats_update',data=>{
-    document.getElementById('stats').innerHTML='الرسائل المرسلة: '+data.sent+'<br>الأخطاء: '+data.errors;
-});
-
-function saveLogin(){
-    fetch('/api/save_login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:document.getElementById('phone').value})})
-    .then(res=>res.json()).then(data=>{document.getElementById('login_status').textContent=data.message;});
-}
-function verifyCode(){
-    fetch('/api/verify_code',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:document.getElementById('code').value})})
-    .then(res=>res.json()).then(data=>{document.getElementById('login_status').textContent=data.message;});
-}
-function sendNow(){
-    fetch('/api/send_now',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-        groups:document.getElementById('groups').value,
-        message:document.getElementById('message').value
-    })}).then(res=>res.json()).then(data=>{
-        let el=document.getElementById('send_status');
-        let m=document.createElement('div'); m.textContent=data.message; el.appendChild(m);
-    });
-}
-function toggleAutoSend(){
-    let intervalSec = parseInt(document.getElementById('interval').value)||30;
-    if(autoSendInterval){
-        clearInterval(autoSendInterval); autoSendInterval=null; alert('تم إيقاف الإرسال التلقائي');
-    }else{
-        autoSendInterval=setInterval(sendNow,intervalSec*1000); alert('تم تفعيل الإرسال التلقائي');
-    }
-}
-function startMonitoring(){
-    fetch('/api/start_monitoring',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-        watch_words:document.getElementById('watch_words').value
-    })}).then(res=>res.json()).then(data=>{
-        document.getElementById('monitor_status').textContent=data.message;
-    });
-}
-function stopMonitoring(){
-    fetch('/api/stop_monitoring',{method:'POST'}).then(res=>res.json()).then(data=>{
-        document.getElementById('monitor_status').textContent=data.message;
-    });
-}
+socket.on('log_update', data => { let log = document.getElementById('log'); log.innerHTML += data.message+'<br>'; log.scrollTop = log.scrollHeight; });
+socket.on('stats_update', data => { document.getElementById('stats').innerHTML = `الرسائل المرسلة: ${data.sent}<br>الأخطاء: ${data.errors}`; });
+function savePhone(){ fetch('/api/save_login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone:document.getElementById('phone').value})}).then(r=>r.json()).then(j=>alert(j.message));}
+function verifyCode(){ fetch('/api/verify_code',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:document.getElementById('code').value})}).then(r=>r.json()).then(j=>alert(j.message));}
+function sendNow(){ fetch('/api/send_now',{method:'POST'}).then(r=>r.json()).then(j=>alert(j.message));}
+function startMonitoring(){ fetch('/api/start_monitoring',{method:'POST'}).then(r=>r.json()).then(j=>alert(j.message));}
+function stopMonitoring(){ fetch('/api/stop_monitoring',{method:'POST'}).then(r=>r.json()).then(j=>alert(j.message));}
 </script>
 </body>
 </html>
-"""
+'''
 
-# ================== Routes ==================
-@app.route("/")
+# ---------- بيانات المستخدم في الذاكرة ----------
+USERS = {}
+USERS_LOCK = threading.Lock()
+
+# ---------- واجهة الصفحة الرئيسية ----------
+@app.route('/')
 def index():
     if 'user_id' not in session:
         session['user_id'] = str(uuid.uuid4())
-    return render_template_string(HTML_TEMPLATE, user_id=session['user_id'])
+    return render_template_string(HTML_PAGE)
 
-# ================== API ==================
-@app.route("/api/save_login", methods=["POST"])
-def save_login():
-    data = request.json
-    phone = data.get("phone")
-    if not phone: return jsonify({"success":False,"message":"❌ أدخل رقم الهاتف"})
-    user_id = session['user_id']
-    session_file = os.path.join(SESSION_DIR, f"{user_id}.session")
+# ---------- وظائف Telegram ----------
+async def send_message_task(user_id):
     with USERS_LOCK:
-        USERS[user_id] = {"phone":phone, "session_file":session_file, "client":None, "running":False, "stats":{"sent":0,"errors":0}}
-    return jsonify({"success":True,"message":"✅ تم حفظ الرقم (الكود تم إرساله)"})
-
-
-@app.route("/api/verify_code", methods=["POST"])
-def verify_code():
-    data = request.json
-    code = data.get("code")
-    user_id = session['user_id']
-    with USERS_LOCK:
-        u = USERS.get(user_id)
-        if not u: return jsonify({"success":False,"message":"❌ لم يتم حفظ الرقم"})
-        client = TelegramClient(u["session_file"], API_ID, API_HASH)
-        client.start(phone=u["phone"], code_callback=lambda: code)
-        USERS[user_id]["client"] = client
-    return jsonify({"success":True,"message":"✅ تم التحقق من الكود وتسجيل الجلسة"})
-
-
-@app.route("/api/send_now", methods=["POST"])
-def send_now():
-    data = request.json
-    groups = [g.strip() for g in data.get("groups","").split('\n') if g.strip()]
-    message = data.get("message","")
-    user_id = session['user_id']
-
-    def task():
-        u = USERS.get(user_id)
-        if not u or not u.get("client"): return
-        client = u["client"]
+        user = USERS[user_id]
+    client = user['client']
+    settings = user['settings']
+    groups = settings['groups'].split('\n')
+    msg = settings['message']
+    interval = settings['interval_sec']
+    while user['running'] and settings['auto_send']:
         for g in groups:
             try:
-                client.loop.run_until_complete(client.send_message(g, message))
-                with USERS_LOCK:
-                    u["stats"]["sent"] +=1
-                socketio.emit("log_update", {"message":f"✅ أرسلت إلى {g}"}, to=user_id)
+                await client.send_message(g, msg)
+                settings['stats_sent'] += 1
+                socketio.emit('log_update', {'message': f'✅ أرسلت إلى {g}'}, to=user_id)
             except Exception as e:
-                with USERS_LOCK:
-                    u["stats"]["errors"] +=1
-                socketio.emit("log_update", {"message":f"❌ فشل الإرسال إلى {g}: {str(e)}"}, to=user_id)
-        socketio.emit("stats_update", u["stats"], to=user_id)
+                settings['stats_errors'] += 1
+                socketio.emit('log_update', {'message': f'❌ فشل الإرسال إلى {g}: {str(e)}'}, to=user_id)
+            socketio.emit('stats_update', {'sent': settings['stats_sent'], 'errors': settings['stats_errors']}, to=user_id)
+        await asyncio.sleep(interval)
 
-    socketio.start_background_task(task)
-    return jsonify({"success":True,"message":"🚀 تم بدء الإرسال"})
+async def monitor_task(user_id):
+    with USERS_LOCK:
+        user = USERS[user_id]
+    client = user['client']
+    words = [w.lower() for w in user['settings']['watch_words'].split('\n') if w.strip()]
+    @client.on(events.NewMessage)
+    async def handler(event):
+        text = event.raw_text.lower()
+        chat = await event.get_chat()
+        sender = await event.get_sender()
+        for w in words:
+            if w in text:
+                msg = f'🔔 كلمة مراقبة: {w}\nمرسل: {sender.id}\nالمجموعة: {chat.title}\nالنص: {event.raw_text}'
+                socketio.emit('log_update', {'message': msg}, to=user_id)
+                await client.send_message(user['settings']['phone'], msg)
+    await client.run_until_disconnected()
 
-@app.route("/api/start_monitoring", methods=["POST"])
-def start_monitoring():
+# ---------- API Endpoints ----------
+@app.route('/api/save_login', methods=['POST'])
+def api_save_login():
+    user_id = session['user_id']
     data = request.json
-    watch_words = [w.strip() for w in data.get("watch_words","").split('\n') if w.strip()]
+    phone = data.get('phone')
+    if not phone:
+        return jsonify({'success': False, 'message':'أدخل الرقم'})
+    session['phone'] = phone
+    # إنشاء أو تحميل client
+    client = TelegramClient(StringSession(), 22043994, '56f64582b363d367280db96586b97801')
+    USERS[user_id] = {'client': client, 'settings': {'phone':phone,'message':'','groups':'','interval_sec':60,'watch_words':'','stats_sent':0,'stats_errors':0,'auto_send':False}, 'running': False}
+    return jsonify({'success': True, 'message':'تم حفظ الرقم'})
+
+@app.route('/api/verify_code', methods=['POST'])
+def api_verify_code():
     user_id = session['user_id']
+    code = request.json.get('code')
+    user = USERS[user_id]
+    client = user['client']
+    async def verify():
+        await client.connect()
+        await client.sign_in(phone=user['settings']['phone'], code=code)
+        user['running'] = True
+    threading.Thread(target=lambda: asyncio.run(verify())).start()
+    return jsonify({'success': True, 'message':'تم التحقق'})
 
-    def monitor_task():
-        u = USERS.get(user_id)
-        if not u or not u.get("client"): return
-        client = u["client"]
-        with USERS_LOCK:
-            u["running"] = True
-
-        @client.on(events.NewMessage())
-        async def handler(event):
-            if not u["running"]: return
-            text = event.message.message
-            for w in watch_words:
-                if w in text:
-                    alert = f"🔔 تم رصد الكلمة '{w}' من {event.sender_id} في {event.chat_id}: {text}"
-                    await client.send_message("me", alert)
-                    socketio.emit("monitor_update", {"message":alert}, to=user_id)
-
-        client.run_until_disconnected()
-
-    socketio.start_background_task(monitor_task)
-    return jsonify({"success":True,"message":"🚀 بدأت المراقبة"})
-
-
-@app.route("/api/stop_monitoring", methods=["POST"])
-def stop_monitoring():
+@app.route('/api/send_now', methods=['POST'])
+def api_send_now():
     user_id = session['user_id']
-    u = USERS.get(user_id)
-    if u: u["running"] = False
-    return jsonify({"success":True,"message":"⏹ تم إيقاف المراقبة"})
+    user = USERS[user_id]
+    asyncio.run(send_message_task(user_id))
+    return jsonify({'success': True, 'message':'تم الإرسال'})
 
+@app.route('/api/start_monitoring', methods=['POST'])
+def api_start_monitoring():
+    user_id = session['user_id']
+    user = USERS[user_id]
+    user['running'] = True
+    threading.Thread(target=lambda: asyncio.run(monitor_task(user_id))).start()
+    return jsonify({'success': True, 'message':'بدأت المراقبة'})
 
-# ================== تشغيل النظام ==================
-if __name__ == "__main__":
-    socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT",5000)), debug=False)
+@app.route('/api/stop_monitoring', methods=['POST'])
+def api_stop_monitoring():
+    user_id = session['user_id']
+    USERS[user_id]['running'] = False
+    return jsonify({'success': True, 'message':'توقفت المراقبة'})
+
+# ---------- تشغيل السيرفر ----------
+if __name__ == '__main__':
+    socketio.run(app, host='0.0.0.0', port=5000)
